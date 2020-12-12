@@ -1,0 +1,18 @@
+interval: 1
+upper: 256
+div1: 4
+middle: 256
+div2: 4
+lower: 256
+picture: status.png
+debug: 9
+hosts:
+  localhost:
+    community: public
+    watch:
+      1.3.6.1.4.1.2021.10.1.6.1:
+        type: gauge
+        min: 0
+        max: 8
+        error: 1.3.6.1.4.1.2021.10.1.100.1
+        msg: 1.3.6.1.4.1.2021.10.1.101.1
