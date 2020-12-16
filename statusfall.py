@@ -5,6 +5,8 @@ from PIL import Image, ImageDraw, ImageShow, ImageFont
 from pysnmp.hlapi import *
 from pysnmp.hlapi.asyncio import *
 from pysnmp.proto import *
+
+
 running=True
 snmpEngine = SnmpEngine()
 FloatBB=bytearray([159,120,4])
@@ -56,6 +58,7 @@ def vb2dict(varBinds):
         bb=v.asOctets()
         if bb[0:3]==FloatBB:
           v2=struct.unpack('>f',bb[3:])
+          v2=v2[0]
         else:
           print('first 3 bytes' , list(bb[0:3]))
       except ValueError as ve:
@@ -68,7 +71,28 @@ def vb2dict(varBinds):
     rv[str(k)]=v2
   return rv
 
-      
+# ##### ##### Variable ##### #####
+class SnmpVariable:
+  
+  def __init__(self,cfg):
+    self.config=cfg
+    if 'min' in cfg:
+      self.min=int(cfg['min'])
+    if 'max' in cfg:
+      self.max=int(cfg['max'])
+    self.oid=cfg['oid']
+    t=getOrDefault(cfg,'type',default='')
+    self.type=t.lower().split()
+    if 'floating' in self.type:
+      self.min=sys.maxsize
+      self.max=-sys.maxsize
+  
+  def adjust(self,v):
+    if v > self.max:
+      self.max=v
+    if v < self.min:
+      self.min=v
+  
 # ##### ##### SNMP ##### #####
 class SnmpHost:
   picLeft=0
@@ -76,21 +100,46 @@ class SnmpHost:
   watch=[]
 
   def __init__(self,addr,hostCfg):
-    self.watch=getOrDefault(hostCfg,'watch',default={})
-    self.picWidth=len(self.watch)
+    watch=getOrDefault(hostCfg,'watch',default={})
+    self.picWidth=len(watch)
     community=getOrDefault(hostCfg,'community',default='public')
     self.comdat=CommunityData(community, mpModel=1)
     port=getOrDefault(hostCfg,'port',default=161)
     self.transport=UdpTransportTarget((addr,port),timeout=1,retries=1)
     self.cntx=ContextData()
+    self.oids=[]
+    for w in watch:
+      oid=getOrDefault(w,'oid',default=None)
+      if oid is None:
+        print('no oid specified for host=%s' % (addr),file=sys.stderr)
+        sys.exit(2)
+      self.oids.append(ObjectType(ObjectIdentity(oid)))
+      if 'error' in w:
+        self.oids.append(ObjectType(ObjectIdentity(w['error'])))
+      if 'msg' in w:
+        self.oids.append(ObjectType(ObjectIdentity(w['msg'])))
+      self.watch.append(SnmpVariable(w))
+      
+    
   
   async def updatePic(self):
-    for i in range(len(self.watch)):
-      errInd, errStat, errIdx, varBinds = await getCmd(snmpEngine, 
-        self.comdat, self.transport, self.cntx, *self.oids)
-      if errStat >0:
-        break
-      rv=vb2dict(varBinds)
+    errInd, errStat, errIdx, varBinds = await getCmd(snmpEngine, 
+      self.comdat, self.transport, self.cntx, *self.oids)
+    if errInd is not None:
+      print('snmp returned with errors:',errInd,errStat,errIdx)
+    rv=vb2dict(varBinds)
+    pos=self.picLeft
+    for w in self.watch:
+      if w.oid in rv:
+        v=rv[w.oid]
+      else:
+        print("didn't found oid in results",w.oid)
+        sys.exit(3)
+      if 'floating' in w.type:
+        w.adjust(v)
+
+    
+    
         
           
 # ##### ##### DynConfig ##### #####
@@ -177,20 +226,6 @@ class SnmpMain:
       host.picLeft=sw
       sw+=host.picWidth+1
       host.draw=self.draw
-      watching=getOrDefault(hostCfg,'watch',default=[])
-      host.watching=watching
-      host.oids=[]
-      for i in range(len(watching)):
-        print('adding watch',i)
-        oid=getOrDefault(watching[i],'oid',default=None)
-        if oid is None:
-          print('no oid specified for host=%s item=%d' % (hostKey,i),file=sys.stderr)
-          sys.exit(2)
-        host.oids.append(ObjectType(ObjectIdentity(oid)))
-        if 'error' in watching[i]:
-          host.oids.append(ObjectType(ObjectIdentity(watching[i]['error'])))
-        if 'msg' in watching[i]:
-          host.oids.append(ObjectType(ObjectIdentity(watching[i]['msg'])))
     self.hosts=newHosts
     
   def rollPic(self):
@@ -241,6 +276,7 @@ class SnmpMain:
     t=self.dc.interval
     await asyncio.sleep(t - (time.time() % t))
     # ## ###
+    print('entering loop')
     while running:
       # print('ok',time.time())
       # check config
