@@ -65,6 +65,9 @@ def vb2dict(varBinds):
         print('opaque not resolved ve:',ve)
       except TypeError as te:
         print('opaque not resolved te:q',te)
+    elif isinstance(v,NoSuchInstance):
+      # no storing
+      continue
     else:
       print('### nope ###')
       print('got',k,type(v),v)
@@ -76,16 +79,32 @@ class SnmpVariable:
   
   def __init__(self,cfg):
     self.config=cfg
-    if 'min' in cfg:
-      self.min=int(cfg['min'])
-    if 'max' in cfg:
-      self.max=int(cfg['max'])
     self.oid=cfg['oid']
     t=getOrDefault(cfg,'type',default='')
     self.type=t.lower().split()
     if 'floating' in self.type:
-      self.min=sys.maxsize
-      self.max=-sys.maxsize
+      self.min=getOrDefault(cfg,'min',default=sys.maxsize)
+      self.max=getOrDefault(cfg,'max',default=-sys.maxsize)
+    else:
+      self.min=getOrDefault(cfg,'min',default=0)
+      self.max=getOrDefault(cfg,'max',default=100)
+    if 'min' in cfg:
+      self.min=int(cfg['min'])
+    if 'max' in cfg:
+      self.max=int(cfg['max'])
+    if 'count' in self.type:
+      self.count=0
+      self.size=0
+    self.error= 'error' in cfg
+          
+  def getDelta(self,v):
+    while v > (2<<self.size):
+      self.size+=1
+    delta=v-self.count
+    self.count=v
+    if delta < 0:
+      delta+= (2<<self.size)
+    return delta
   
   def adjust(self,v):
     if v > self.max:
@@ -95,11 +114,11 @@ class SnmpVariable:
   
 # ##### ##### SNMP ##### #####
 class SnmpHost:
-  picLeft=0
-  picWidth=0
-  watch=[]
 
   def __init__(self,addr,hostCfg):
+    self.picLeft=0
+    self.picWidth=0
+    self.watch=[]
     watch=getOrDefault(hostCfg,'watch',default={})
     self.picWidth=len(watch)
     community=getOrDefault(hostCfg,'community',default='public')
@@ -123,6 +142,7 @@ class SnmpHost:
     
   
   async def updatePic(self):
+    self.errors=[]
     errInd, errStat, errIdx, varBinds = await getCmd(snmpEngine, 
       self.comdat, self.transport, self.cntx, *self.oids)
     if errInd is not None:
@@ -130,13 +150,42 @@ class SnmpHost:
     rv=vb2dict(varBinds)
     pos=self.picLeft
     for w in self.watch:
-      if w.oid in rv:
-        v=rv[w.oid]
-      else:
-        print("didn't found oid in results",w.oid)
-        sys.exit(3)
-      if 'floating' in w.type:
-        w.adjust(v)
+      pos+=1
+      try:
+        if w.error:
+          v=rv[w.config['error']]
+          if v > 0:
+            self.draw.point((pos,1),(255,0,127))
+            if 'msg' in w.config:
+              s=rv[w.config['msg']]
+              self.errors.append(s)
+            continue
+        if w.oid in rv:
+          v=rv[w.oid]
+        else:
+          print("didn't found oid in results",w.oid)
+          sys.exit(3)
+        if 'count' in w.type:
+          if w.size == 0:
+            w.size=1
+            w.count=v
+            self.draw.point((pos,1),(0,0,255))
+            continue
+          else:
+            v=w.getDelta(v)
+        if 'floating' in w.type:
+          w.adjust(v)
+        if 'gauge' in w.type or 'count' in w.type:
+          if w.max <= w.min:
+            self.draw.point((pos,1),(0,76,153))
+            continue
+          v=(v-w.min)/(w.max-w.min)
+          if 'reverse' in w.type:
+            v=1.0-v
+          self.draw.point((pos,1),getColor(v))
+          continue
+      except:
+          self.draw.point((pos,1),(204,0,204))
 
     
     
@@ -144,7 +193,6 @@ class SnmpHost:
           
 # ##### ##### DynConfig ##### #####
 class DynConfig:
-  config={}
   cfgTime=0
   
   def check(self):
@@ -174,26 +222,27 @@ class DynConfig:
     
   def __init__(self,fileName):
     print('init dyn config')
+    self.config={}
     self.fileName=fileName
     self.check()
 
 # ##### ##### SnmpMain ##### #####
 class SnmpMain:
-  picture=None
-  hosts={}
-  itUpper=0
-  itMiddle=0
 
   
   def __init__(self):
+    self.picture=None
+    self.hosts=[]
+    self.itUpper=0
+    self.itMiddle=0
     self.font=ImageFont.truetype('FreeMono.ttf',14)
     
   def newPic(self):
     oldPic=self.picture
     width=1
-    hosts=getOrDefault(self.dc.config,'hosts',default={})
+    hosts=getOrDefault(self.dc.config,'hosts',default=[])
     for h in hosts:
-      w= getOrDefault(hosts[h],'watch',default={})
+      w= getOrDefault(h,'watch',default={})
       width+=len(w)
       width+=1
     height=4
@@ -214,15 +263,18 @@ class SnmpMain:
       # TODO: copy the older parts or not
 
   def updateHosts(self):
-    hosts=getOrDefault(self.dc.config,'hosts',default={})
+    hosts=getOrDefault(self.dc.config,'hosts',default=[])
     oldHosts=self.hosts
-    newHosts={}
-    sw=1
-    for hostKey in hosts:
-      print('configuring host',hostKey)
-      hostCfg=hosts[hostKey]
-      host=SnmpHost(hostKey,hostCfg)
-      newHosts[hostKey]=host
+    newHosts=[]
+    sw=0
+    for hostCfg in hosts:
+      if 'host' not in hostCfg:
+        print('no hostname specified',file=sys.stderr)
+        sys.exit(2)
+      hostname=hostCfg['host']
+      print('configuring host',hostname)
+      host=SnmpHost(hostname,hostCfg)
+      newHosts.append(host)
       host.picLeft=sw
       sw+=host.picWidth+1
       host.draw=self.draw
@@ -277,6 +329,7 @@ class SnmpMain:
     await asyncio.sleep(t - (time.time() % t))
     # ## ###
     print('entering loop')
+    errors=[]
     while running:
       # print('ok',time.time())
       # check config
@@ -286,8 +339,13 @@ class SnmpMain:
         self.updateHosts()
       # do work
       self.rollPic()
+      olderrors=len(errors)
+      errors=[]
       for h in self.hosts:
-        asyncio.create_task(self.hosts[h].updatePic())
+        errors.append(*h.errors)
+        asyncio.create_task(h.updatePic())
+      if olderrors <> len(errors):
+        print('got different set of errors')
       # wait for next
       t=self.dc.interval
       await asyncio.sleep(t - (time.time() % t ))
@@ -295,7 +353,9 @@ class SnmpMain:
 
 if __name__ == '__main__':
   print('main started')
-  signal.signal(signal.SIGINT,sigHandler)  
+  # signal.signal(signal.SIGINT,sigHandler)
+  signal.signal(signal.SIGQUIT,sigHandler)  
+  signal.signal(signal.SIGTSTP,sigHandler)  
   m=SnmpMain()
   asyncio.run(m.main())
   print('all done')
