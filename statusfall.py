@@ -33,6 +33,11 @@ page="""<html>
     padding: 15px;
     color: white;
   }
+  #errors {
+    padding: 5;
+    color: red;
+    font-weight: bold;
+  }  
   #host {
     color: yellow;
     font-size: small;
@@ -50,13 +55,20 @@ page="""<html>
     const myPic = document.getElementById('pic');
     const msg = document.getElementById('msg');
     const host= document.getElementById('host');
+    const errors=document.getElementById('errors');
     myPic.addEventListener('mouseenter', e => {
       fetch('{{file}}.js').then(e => {
         return e.json();
       }).then(e => {
         hostData=e;
-        console.log('got data '+JSON.stringify(e, null, 2));        
+        // console.log('got data '+JSON.stringify(e, null, 2));        
       });
+      fetch('status.txt').then(e => {
+        return e.text();
+      }).then( e => {
+        console.log('got ',e)
+        errors.innerHTML=e;
+      });      
     });
     myPic.addEventListener('mousemove', e => {
       if (e.offsetX < hostData.vars.length){
@@ -82,6 +94,8 @@ page="""<html>
     myPic.addEventListener('mouseout', e => {
       // confirm('everything ok?');
       msg.innerHTML='';
+      host.innerHTML='';
+      errors.innerHTML='';
     });
     setTimeout(reloadStatus,2000);
   }
@@ -93,11 +107,13 @@ page="""<html>
 </div>
 <div id="bottom">
   <div>
+    <span id="errors">
+    </div>
+  <div>
     <span id="msg">
       move mouse over picture
       </span>
   </div>
-  <hr />
   <div>
     <span id="host">
       </span>
@@ -409,7 +425,7 @@ class SnmpMain:
     for host in self.hosts:
       w4h.append(host.updateHostInfo())
     await asyncio.gather(*w4h)
-    print('got all host info')
+    # print('got all host info')
     hd=[]
     vd=[]
     for host in self.hosts:
@@ -427,7 +443,7 @@ class SnmpMain:
       json.dump(stat,out,indent=2)
     tm=jinja2.Template(page)
     ht=os.path.split(self.dc.statFileName)
-    # d={'interval': self.dc.interval, 'file': ht[1]}
+    d={'interval': self.dc.interval, 'file': ht[1]}
     t=tm.render(d)
     with open(self.dc.statFileName+'.html','w') as out:
       out.write(t)
@@ -483,6 +499,8 @@ class SnmpMain:
     # ## ###
     print('entering loop')
     errors=[]
+    hostInfoTime=time.time()
+    errors=['nothing here yet']
     while running:
       # print('ok',time.time())
       # check config
@@ -496,10 +514,19 @@ class SnmpMain:
       errors=[]
       for h in self.hosts:
         for err in h.errors:
-          errors.append(err)
+          errors.append(self.infoName+': '+err)
         asyncio.create_task(h.updatePic())
+      tt=time.time()
+      if tt > hostInfoTime+300:
+        hostInfoTime=tt
+        await self.updateStatusInfo()
       if olderrors != len(errors):
-        print('got different set of errors')
+        if(len(errors)>0):
+          s=string.join(errors,'<br />')
+        else:
+          s=''
+        with open(self.dc.statFileName+'.txt','w') as out:
+          out.write(s)
       # wait for next
       t=self.dc.interval
       await asyncio.sleep(t - (time.time() % t ))
