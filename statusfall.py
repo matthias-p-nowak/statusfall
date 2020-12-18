@@ -1,6 +1,6 @@
 #!python
 
-import asyncio,yaml,os,time,signal,datetime,sys,struct
+import asyncio,yaml,os,time,signal,datetime,sys,struct,json,jinja2
 from PIL import Image, ImageDraw, ImageShow, ImageFont
 from pysnmp.hlapi import *
 from pysnmp.hlapi.asyncio import *
@@ -10,6 +10,104 @@ from pysnmp.proto import *
 running=True
 snmpEngine = SnmpEngine()
 FloatBB=bytearray([159,120,4])
+hostInfo={
+  "desc": "1.3.6.1.2.1.1.1.0",
+  "contact": "1.3.6.1.2.1.1.4.0",
+  "name": "1.3.6.1.2.1.1.5.0",
+  "loc": "1.3.6.1.2.1.1.6.0"  
+}
+
+page="""<html>
+<head>
+  <title>Status waterfall</title>
+  <meta http-equiv="Cache-Control" content="no-cache" />
+  <meta http-equiv="Access-Control-Allow-Origin" content="*" />
+<style>
+  body {
+    background: #085C21;
+  }
+  #top {
+    align-content: center;
+  }
+  #bottom {
+    padding: 15px;
+    color: white;
+  }
+  #host {
+    color: yellow;
+    font-size: small;
+  }
+</style>
+<script>
+  var hostData={};
+  function reloadStatus(){
+    const myPic = document.getElementById('pic');
+    var timestamp = new Date().getTime(); 
+    pic.src="{{ file }}.png?"+timestamp;
+    setTimeout(reloadStatus,{{ interval }}*1000);
+  }
+  function status_init(){    
+    const myPic = document.getElementById('pic');
+    const msg = document.getElementById('msg');
+    const host= document.getElementById('host');
+    myPic.addEventListener('mouseenter', e => {
+      fetch('{{file}}.js').then(e => {
+        return e.json();
+      }).then(e => {
+        hostData=e;
+        console.log('got data '+JSON.stringify(e, null, 2));        
+      });
+    });
+    myPic.addEventListener('mousemove', e => {
+      if (e.offsetX < hostData.vars.length){
+        var hd=hostData.vars[e.offsetX]
+        if (hd){
+          var hinfo=hd['host']
+          hinfo=hostData.hosts[hinfo]
+          host.innerHTML=hinfo.name +' @ '+hinfo.loc + '<br />'+hinfo.desc+' ['+hinfo.contact+']';
+          s='';
+          if(hd.desc){
+            var s=hd.desc;
+          }
+          s+='('+hd.oid+')';
+          msg.innerHTML=s;
+        }
+        else{
+          msg.innerHTML='-';
+        }
+      }else{
+        msg.innerHTML='<---';
+      }
+    });
+    myPic.addEventListener('mouseout', e => {
+      // confirm('everything ok?');
+      msg.innerHTML='';
+    });
+    setTimeout(reloadStatus,2000);
+  }
+</script>
+</head>
+<body onload="status_init();">
+<div id="top">
+<img id="pic" src="{{file}}.png" />
+</div>
+<div id="bottom">
+  <div>
+    <span id="msg">
+      move mouse over picture
+      </span>
+  </div>
+  <hr />
+  <div>
+    <span id="host">
+      </span>
+    </div>
+</div>
+</body>
+
+</html>
+
+"""
 
 def sigHandler(signum, frame):
   global running
@@ -119,6 +217,11 @@ class SnmpHost:
     self.picLeft=0
     self.picWidth=0
     self.watch=[]
+    self.errors=[]
+    self.infoName=addr
+    self.infoLoc=''
+    self.infoDesc=''
+    self.infoContact='no connection'
     watch=getOrDefault(hostCfg,'watch',default={})
     self.picWidth=len(watch)
     community=getOrDefault(hostCfg,'community',default='public')
@@ -139,14 +242,35 @@ class SnmpHost:
         self.oids.append(ObjectType(ObjectIdentity(w['msg'])))
       self.watch.append(SnmpVariable(w))
       
-    
+  async def updateHostInfo(self):
+    oids=[]
+    for i in hostInfo:
+      oids.append(ObjectType(ObjectIdentity(hostInfo[i])))
+    errInd, errStat, errIdx, varBinds = await getCmd(snmpEngine, 
+      self.comdat, self.transport, self.cntx, *oids)
+    if errInd is not None:
+      print('snmp returned with errors:',errInd,errStat,errIdx)
+      self.failed=True
+      return
+    rv=vb2dict(varBinds)
+    hi={}
+    for i in hostInfo:
+      try:
+        hi[i]=rv[hostInfo[i]]
+      except:
+        hi[i]='-failed-'
+    self.infoName=hi['name']
+    self.infoLoc=hi['loc']
+    self.infoDesc=hi['desc']
+    self.infoContact=hi['contact']
   
   async def updatePic(self):
     self.errors=[]
     errInd, errStat, errIdx, varBinds = await getCmd(snmpEngine, 
       self.comdat, self.transport, self.cntx, *self.oids)
     if errInd is not None:
-      print('snmp returned with errors:',errInd,errStat,errIdx)
+      # print('snmp returned with errors:',errInd,errStat,errIdx)
+      return
     rv=vb2dict(varBinds)
     pos=self.picLeft
     for w in self.watch:
@@ -213,9 +337,9 @@ class DynConfig:
           self.interval=getOrDefault(c,'interval',default=5)
           self.div1=getOrDefault(c,'div1',default=4)
           self.div2=getOrDefault(c,'div2',default=4)
-          self.picFileName=getOrDefault(c,'picture',default='status.pnp')
-          parts=os.path.splitext(self.picFileName)
-          self.tmpPicFileName=parts[0]+'-tmp'+parts[1]
+          self.statFileName=getOrDefault(c,'statusData',default='status')
+          self.picFileName=self.statFileName+'.png'
+          self.tmpPicFileName=self.statFileName+'-tmp.png'
           
           return True
     return False
@@ -262,7 +386,7 @@ class SnmpMain:
       self.draw=ImageDraw.Draw(im)
       # TODO: copy the older parts or not
 
-  def updateHosts(self):
+  async def updateHosts(self):
     hosts=getOrDefault(self.dc.config,'hosts',default=[])
     oldHosts=self.hosts
     newHosts=[]
@@ -279,6 +403,34 @@ class SnmpMain:
       sw+=host.picWidth+1
       host.draw=self.draw
     self.hosts=newHosts
+    
+  async def updateStatusInfo(self):
+    w4h=[]
+    for host in self.hosts:
+      w4h.append(host.updateHostInfo())
+    await asyncio.gather(*w4h)
+    print('got all host info')
+    hd=[]
+    vd=[]
+    for host in self.hosts:
+      pos=len(hd)
+      hd.append( { 'name': host.infoName, 'loc': host.infoLoc, 'contact': host.infoContact, 'desc': host.infoDesc })
+      vd.append(None)
+      for w in host.watch:
+        d={ 'host': pos}
+        if 'description' in w.config:
+          d['desc']=w.config['description']
+        d['oid']=w.oid
+        vd.append(d)
+    stat={'hosts': hd, 'vars': vd}
+    with open(self.dc.statFileName+'.js','w') as out:
+      json.dump(stat,out,indent=2)
+    tm=jinja2.Template(page)
+    ht=os.path.split(self.dc.statFileName)
+    # d={'interval': self.dc.interval, 'file': ht[1]}
+    t=tm.render(d)
+    with open(self.dc.statFileName+'.html','w') as out:
+      out.write(t)
     
   def rollPic(self):
     savePic=self.picture.copy()
@@ -324,7 +476,8 @@ class SnmpMain:
     # TODO: make config file an optional argument
     self.dc=DynConfig('statusfall.yaml')
     self.newPic()
-    self.updateHosts()
+    await self.updateHosts()
+    await self.updateStatusInfo()
     t=self.dc.interval
     await asyncio.sleep(t - (time.time() % t))
     # ## ###
@@ -336,15 +489,16 @@ class SnmpMain:
       if  self.dc.check():
         print('new config')
         self.newPic()
-        self.updateHosts()
+        await self.updateHosts()
       # do work
       self.rollPic()
       olderrors=len(errors)
       errors=[]
       for h in self.hosts:
-        errors.append(*h.errors)
+        for err in h.errors:
+          errors.append(err)
         asyncio.create_task(h.updatePic())
-      if olderrors <> len(errors):
+      if olderrors != len(errors):
         print('got different set of errors')
       # wait for next
       t=self.dc.interval
