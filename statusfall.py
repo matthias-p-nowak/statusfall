@@ -489,8 +489,10 @@ class SnmpMain:
 
   
   async def main(self):
-    # TODO: make config file an optional argument
-    self.dc=DynConfig('statusfall.yaml')
+    configFile='statusfall.yaml'
+    if len(sys.argv) > 1:
+      configFile=sys.argv[1]
+    self.dc=DynConfig(configFile)
     self.newPic()
     await self.updateHosts()
     await self.updateStatusInfo()
